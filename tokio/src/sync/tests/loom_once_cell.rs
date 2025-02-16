@@ -3,6 +3,7 @@ use loom::future::block_on;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::Arc;
 use loom::thread;
+use std::future::{poll_fn, Future};
 
 #[test]
 fn zst() {
@@ -102,5 +103,33 @@ fn init_attempt_happens_before() {
                 | (Some(2), Some(0), Some(1))
                 | (Some(2), Some(1), Some(0)),
         ));
+    });
+}
+
+#[test]
+fn unset() {
+    loom::model(|| {
+        let cell = Arc::new(OnceCell::new());
+
+        // spawn a thread to set and unset the cell after polling `wait_initialized`
+        // a first time, to test if the task future completes even if the cell is
+        // unset before the task is awakened.
+        let mut th1 = None;
+        block_on(async {
+            let mut wait = std::pin::pin!(cell.wait_initialized());
+            poll_fn(|cx| {
+                let poll = wait.as_mut().poll(cx);
+                if th1.is_none() {
+                    let cell2 = cell.clone();
+                    th1 = Some(thread::spawn(move || {
+                        cell2.set(()).unwrap();
+                        cell2.unset();
+                    }))
+                }
+                poll
+            })
+            .await;
+        });
+        th1.unwrap();
     });
 }

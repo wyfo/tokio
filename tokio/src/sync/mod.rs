@@ -488,6 +488,9 @@ cfg_sync! {
     mod once_cell;
     pub use self::once_cell::{OnceCell, SetError};
 
+    mod event;
+    pub use self::event::Event;
+
     pub mod watch;
 }
 

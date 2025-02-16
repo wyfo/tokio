@@ -454,7 +454,12 @@ impl<T> OnceCell<T> {
 
     /// Wait for the state to have the required value.
     /// If the node is pushed in the waiter
-    fn poll_wait(&self, cx: &mut Context<'_>, node: Pin<&mut Waiter>) -> Poll<u8> {
+    fn poll_wait(
+        &self,
+        cx: &mut Context<'_>,
+        node: Pin<&mut Waiter>,
+        previously_queued: bool,
+    ) -> Poll<u8> {
         // Clone the waker before locking, a waker clone can be triggering arbitrary code.
         let waker = cx.waker().clone();
         let mut waiters = self.waiters.lock();
@@ -473,6 +478,14 @@ impl<T> OnceCell<T> {
                 unsafe { waiters.remove(NonNull::from(node)) };
             }
             Poll::Ready(state)
+        // With ZST, it is possible to unset the cell, so it can happen
+        // that the waiter has been awakened, but the check above still fails.
+        // In that case, we can simply check if the waker has been used to
+        // acknowledge the notification.
+        } else if std::mem::size_of::<T>() == 0 && previously_queued && node.waker.is_none() {
+            // Uses acquire ordering to have happens-before relation
+            // with cell initialization
+            return Poll::Ready(self.state.load(Ordering::Acquire));
         } else {
             // If there is no waker, it means the node is not queued,
             // so it is pushed in the list.
@@ -490,8 +503,11 @@ impl<T> OnceCell<T> {
             return value;
         }
         let state = WaitFuture::new(self, false).await;
-        debug_assert_eq!(state, STATE_SET);
-        // SAFETY: the cell has been initialized
+        // ZST can be unset after having been set
+        if std::mem::size_of::<T>() != 0 {
+            debug_assert_eq!(state, STATE_SET);
+        }
+        // SAFETY: the cell has been initialized, or is a ZST
         unsafe { self.get_unchecked() }
     }
 
@@ -618,6 +634,22 @@ impl<T> OnceCell<T> {
     /// `None` if the cell is empty.
     pub fn take(&mut self) -> Option<T> {
         std::mem::take(self).into_inner()
+    }
+}
+
+impl OnceCell<()> {
+    /// Unset the cell, leaving it uninitialized.
+    pub(crate) fn unset(&self) {
+        // Uses release ordering to have happens-before relation
+        // with following `initialized`.
+        self.state.store(STATE_UNSET, Ordering::Release);
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
+        self.resource_span.in_scope(|| {
+            tracing::trace!(
+                target: "runtime::resource::state_update",
+                state = "unset",
+            );
+        });
     }
 }
 
@@ -750,7 +782,7 @@ impl<T> Future for WaitFuture<'_, T> {
         let (node, cell, maybe_queued) = self.project();
         let coop = ready!(crate::task::coop::poll_proceed(cx));
 
-        match cell.poll_wait(cx, node) {
+        match cell.poll_wait(cx, node, *maybe_queued) {
             Poll::Ready(state) => {
                 coop.made_progress();
                 *maybe_queued = false;
